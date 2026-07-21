@@ -54,7 +54,7 @@
   apps/platform/src/gen/compose.ts の SUPPORTED_RUNTIME_VERSION と一致させる
   （不一致は合成を拒否する = 保存済み HTML は不変というルールを守るため）。
 -->
-<script>var RUNTIME_VERSION = "rt-9";</script>
+<script>var RUNTIME_VERSION = "rt-10";</script>
 <!--
   GAME_ASSETS: 合成器（compose.ts）が生成素材（M2c・D-018）の data URI マニフェストを
   「var __GAMEKIT_ASSETS__ = ...;」の形で注入する（素材なしでも空マニフェストを注入する）。
@@ -168,6 +168,21 @@ var __GAMEKIT_ASSETS__ = {"images":{"chef":"data:image/png;base64,iVBORw0KGgoAAA
     if (data.saveData !== undefined && data.saveData !== null && typeof data.saveData === 'object') {
       savedData = data.saveData;
     }
+    // rt-10: プレイページが公開タイトルを注入する。生成ロジックの config.title より優先して
+    // タイトル画面に出す（公開時に付け直したタイトルと画面内表記が食い違う問題への対処。
+    // 未指定（プレビュー等）は従来どおり config.title にフォールバックする）
+    if (typeof data.publicTitle === 'string' && data.publicTitle.trim()) {
+      publicTitle = data.publicTitle.trim();
+    }
+    // rt-10: タイトル画面にアプリアイコン風のサムネイルを表示する（無指定なら emoji のまま）。
+    // CSP img-src は自オリジンと data:/blob: のみのため、プレイページが同一オリジン URL か
+    // data URI で渡す（docs/design-ui.md 3.7 節）。ロードは即座に開始し、間に合わなければ
+    // 描画ループ側が img.complete を見て自然に次フレームから出す
+    if (typeof data.thumbUrl === 'string' && data.thumbUrl && !titleThumbImg && typeof global.Image === 'function') {
+      var thumbImg = new global.Image();
+      thumbImg.src = data.thumbUrl;
+      titleThumbImg = thumbImg;
+    }
     diagPort = (event.ports && event.ports[0]) || null;
     if (!diagPort) {
       return;
@@ -206,6 +221,8 @@ var __GAMEKIT_ASSETS__ = {"images":{"chef":"data:image/png;base64,iVBORw0KGgoAAA
   var lastPointerY = 0;
   var lastFrameTime = 0;
   var audioCtx = null;
+  var publicTitle = null; // rt-10: プレイページ注入の公開タイトル（config.title より優先）
+  var titleThumbImg = null; // rt-10: プレイページ注入のサムネイル（タイトル画面のアプリアイコン用）
 
   // ==========================================================================
   // Canvas / DPR
@@ -831,17 +848,93 @@ var __GAMEKIT_ASSETS__ = {"images":{"chef":"data:image/png;base64,iVBORw0KGgoAAA
     }
   }
 
+  // rt-10: サムネイルが読み込み済み（デコード成功）なときだけ true。GameKit.asset() の
+  // getAsset() と同じ判定（未完了/破損画像で drawImage が throw するのを防ぐ）
+  function titleThumbReady() {
+    return !!(titleThumbImg && titleThumbImg.complete && titleThumbImg.naturalWidth);
+  }
+
+  // rt-10: タイトル画面のサムネイルを iOS アプリアイコン風（角丸正方形 + 影 + 薄い縁）に描く。
+  // サムネイルは横長（カード比率）で来るため object-fit: cover 相当の中央クロップで正方形に収める
+  function drawTitleIcon(cx, cy, size) {
+    if (!titleThumbReady()) {
+      return false;
+    }
+    var radius = size * 0.22;
+    ctx.save();
+    ctx.shadowColor = 'rgba(0, 0, 0, 0.45)';
+    ctx.shadowBlur = 14;
+    ctx.shadowOffsetY = 4;
+    drawRoundedRect(cx - size / 2, cy - size / 2, size, size, radius);
+    ctx.fillStyle = '#0b1020';
+    ctx.fill();
+    ctx.restore();
+
+    ctx.save();
+    drawRoundedRect(cx - size / 2, cy - size / 2, size, size, radius);
+    ctx.clip();
+    var iw = titleThumbImg.naturalWidth;
+    var ih = titleThumbImg.naturalHeight;
+    var scale = Math.max(size / iw, size / ih);
+    var dw = iw * scale;
+    var dh = ih * scale;
+    ctx.drawImage(titleThumbImg, cx - dw / 2, cy - dh / 2, dw, dh);
+    ctx.restore();
+
+    ctx.save();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.28)';
+    drawRoundedRect(cx - size / 2, cy - size / 2, size, size, radius);
+    ctx.stroke();
+    ctx.restore();
+    return true;
+  }
+
+  var TITLE_MAX_FONT_PX = 30;
+  var TITLE_MIN_FONT_PX = 16;
+
+  // rt-10: 公開タイトルは最大 60 文字（manage.ts TITLE_MAX_CHARS）まで許容されるが、
+  // 元の固定 30px 1 行描画では画面幅をはみ出して読めなくなる（Codex レビュー指摘。
+  // 生成ロジックの config.title は短い想定だったため今まで顕在化しなかった）。
+  // 幅に収まるまでフォントサイズを段階的に縮小し、最小サイズでも収まらなければ
+  // コードポイント単位で末尾を切り詰めて省略記号を付ける（drawWrappedText と同じ考え方）。
+  // 呼び出し後、ctx.font は最終的に使ったサイズのままになる（呼び出し側は必要なら明示的に戻す）
+  function drawFittedTitle(text, cx, cy, maxWidth) {
+    var size = TITLE_MAX_FONT_PX;
+    while (size > TITLE_MIN_FONT_PX) {
+      ctx.font = 'bold ' + size + 'px sans-serif';
+      if (ctx.measureText(text).width <= maxWidth) {
+        break;
+      }
+      size -= 2;
+    }
+    ctx.font = 'bold ' + size + 'px sans-serif';
+    var display = text;
+    if (ctx.measureText(display).width > maxWidth) {
+      var chars = Array.from(display);
+      while (chars.length > 1 && ctx.measureText(chars.join('') + '…').width > maxWidth) {
+        chars.pop();
+      }
+      display = chars.join('') + '…';
+    }
+    ctx.fillText(display, cx, cy);
+  }
+
   function drawTitleScreen() {
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
 
-    if (config.emoji) {
+    // rt-10: サムネイルがあればアプリアイコン風に、無ければ従来どおり emoji にフォールバックする
+    var iconSize = Math.min(112, cssWidth * 0.32);
+    var iconDrawn = drawTitleIcon(cssWidth / 2, cssHeight * 0.35, iconSize);
+    if (!iconDrawn && config.emoji) {
       drawEmoji(ctx, config.emoji, cssWidth / 2, cssHeight * 0.38, 56);
     }
 
     ctx.fillStyle = '#ffffff';
-    ctx.font = 'bold 30px sans-serif';
-    ctx.fillText(config.title || 'ゲーム', cssWidth / 2, cssHeight * 0.56);
+    // rt-10: 公開タイトル（プレイページ注入）を優先し、無ければ生成ロジックの config.title。
+    // 幅に収まるようフォントを自動縮小する（drawFittedTitle。P2: 長いタイトルの見切れ対策）
+    drawFittedTitle(publicTitle || config.title || 'ゲーム', cssWidth / 2, cssHeight * 0.56, cssWidth - 48);
 
     if (config.instructions) {
       ctx.font = '16px sans-serif';
@@ -1075,13 +1168,14 @@ var COLS = 10;
 var INITIAL_ROWS = 5;
 var ADD_EVERY = 6;
 var SPEED = 950;
+var FIRE_DELAY = 1.0; // 操作が止まってから発射されるまでの秒数
 
 var TYPES = [
-  { color: "#FF6B9D", emoji: "🍭" },
-  { color: "#4FC3F7", emoji: "🍬" },
-  { color: "#FFD54F", emoji: "🍮" },
-  { color: "#7ED491", emoji: "🍡" },
-  { color: "#FF9E5E", emoji: "🍪" }
+  { color: "#FF6B9D" }, // 渦巻きキャンディ
+  { color: "#4FC3F7" }, // 包みキャンディ
+  { color: "#FFD54F" }, // プリン
+  { color: "#7ED491" }, // 三色だんご
+  { color: "#FF9E5E" }  // クッキー
 ];
 
 var grid = [];
@@ -1093,8 +1187,14 @@ var aimAngle = -Math.PI / 2;
 var shot = null;
 var flying = [];
 var pops = [];
+var jiggles = []; // プルプル中のセル {row, col, t}
 var shotsLeft = ADD_EVERY;
 var finished = false;
+var dragDist = 0;
+var stillTime = 0;
+var aiming = false;
+var lastDragX = -1;
+var lastDragY = -1;
 
 function rowParity(row) { return (row + parityBase) % 2; }
 function rowCols(row) { return rowParity(row) === 0 ? COLS : COLS - 1; }
@@ -1162,6 +1262,7 @@ function isDanger() {
 }
 function refill() {
   grid = [];
+  jiggles = [];
   for (var i = 0; i < INITIAL_ROWS; i++) { ensureRow(i); grid[i] = filledRow(i); }
   current = pickColor();
   nextColor = pickColor();
@@ -1169,6 +1270,8 @@ function refill() {
 function addTopRow() {
   parityBase = (parityBase + 1) % 2;
   grid.unshift(filledRow(0));
+  // 行が1段下にずれるので、プルプル中のセル位置もずらす
+  for (var i = 0; i < jiggles.length; i++) jiggles[i].row++;
 }
 function collide(x, y) {
   var rr = Math.round((y - r) / rowH);
@@ -1215,6 +1318,9 @@ function snapShot(s, hitR, hitC) {
     if (!best) { ensureRow(grid.length); best = [grid.length - 1, 0]; }
   }
   grid[best[0]][best[1]] = s.color;
+  // プルプル: くっついたお菓子と、当たったお菓子を揺らす
+  jiggles.push({ row: best[0], col: best[1], t: 0 });
+  if (hitR >= 0) jiggles.push({ row: hitR, col: hitC, t: 0 });
   resolveBoard(best[0], best[1]);
 }
 function resolveBoard(row, col) {
@@ -1233,7 +1339,7 @@ function resolveBoard(row, col) {
     for (var i = 0; i < ns.length; i++) stack.push(ns[i]);
   }
   if (group.length >= 3) {
-    for (i = 0; i < group.length; i++) {
+    for (var i = 0; i < group.length; i++) {
       var gr = group[i][0], gc = group[i][1];
       pops.push({ x: cellX(gr, gc), y: cellY(gr), t: 0 });
       grid[gr][gc] = null;
@@ -1295,19 +1401,174 @@ function setAim(x, y) {
   }
   aimAngle = a;
 }
+function fire() {
+  if (finished || shot) return false;
+  GameKit.sfx.play("se_shoot");
+  shot = {
+    x: shooterX,
+    y: muzzleY,
+    vx: Math.cos(aimAngle) * SPEED,
+    vy: Math.sin(aimAngle) * SPEED,
+    color: current
+  };
+  current = nextColor;
+  nextColor = pickColor();
+  shotsLeft--;
+  if (shotsLeft <= 0) {
+    shotsLeft = ADD_EVERY;
+    addTopRow();
+    if (isDanger()) {
+      finished = true;
+      GameKit.sfx.play("hit");
+      GameKit.gameOver();
+    }
+  }
+  return true;
+}
+// 指定セルのプルプル量(伸縮率)を返す。揺れていなければ 0
+function jiggleAt(row, col) {
+  var D = 0.5; // 揺れの長さ(秒)
+  for (var i = 0; i < jiggles.length; i++) {
+    if (jiggles[i].row === row && jiggles[i].col === col) {
+      var k = jiggles[i].t / D;
+      if (k >= 1) return 0;
+      return Math.sin(jiggles[i].t * 28) * 0.16 * (1 - k);
+    }
+  }
+  return 0;
+}
 function drawCandy(ctx, x, y, type, rad) {
   var t = TYPES[type];
   ctx.save();
-  ctx.fillStyle = t.color;
+  ctx.translate(x, y);
+  // 共通のうすい影
+  ctx.fillStyle = "rgba(120, 60, 90, 0.15)";
   ctx.beginPath();
-  ctx.arc(x, y, rad * 0.95, 0, Math.PI * 2);
+  ctx.arc(rad * 0.06, rad * 0.14, rad * 0.9, 0, Math.PI * 2);
   ctx.fill();
-  ctx.fillStyle = "rgba(255,255,255,0.35)";
+
+  if (type === 0) {
+    // 渦巻きキャンディ(ピンク × 白)
+    ctx.fillStyle = t.color;
+    ctx.beginPath();
+    ctx.arc(0, 0, rad * 0.92, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = "rgba(255, 255, 255, 0.9)";
+    for (var k = 0; k < 3; k++) {
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.arc(0, 0, rad * 0.88, k * (Math.PI * 2 / 3), k * (Math.PI * 2 / 3) + Math.PI / 3);
+      ctx.closePath();
+      ctx.fill();
+    }
+    ctx.strokeStyle = "rgba(216, 70, 120, 0.6)";
+    ctx.lineWidth = rad * 0.08;
+    ctx.beginPath();
+    ctx.arc(0, 0, rad * 0.92, 0, Math.PI * 2);
+    ctx.stroke();
+  } else if (type === 1) {
+    // 包みキャンディ(水色)
+    ctx.fillStyle = "#A5E3FF";
+    ctx.beginPath();
+    ctx.moveTo(-rad * 0.5, 0);
+    ctx.lineTo(-rad * 0.95, -rad * 0.45);
+    ctx.lineTo(-rad * 0.95, rad * 0.45);
+    ctx.closePath();
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(rad * 0.5, 0);
+    ctx.lineTo(rad * 0.95, -rad * 0.45);
+    ctx.lineTo(rad * 0.95, rad * 0.45);
+    ctx.closePath();
+    ctx.fill();
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(0, 0, rad * 0.64, 0, Math.PI * 2);
+    ctx.clip();
+    ctx.fillStyle = t.color;
+    ctx.fillRect(-rad, -rad, rad * 2, rad * 2);
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.75)";
+    ctx.lineWidth = rad * 0.16;
+    for (var s = -1; s <= 1; s++) {
+      ctx.beginPath();
+      ctx.moveTo(-rad, s * rad * 0.42 - rad * 0.8);
+      ctx.lineTo(rad, s * rad * 0.42 + rad * 0.8);
+      ctx.stroke();
+    }
+    ctx.restore();
+    ctx.strokeStyle = "rgba(30, 130, 180, 0.5)";
+    ctx.lineWidth = rad * 0.07;
+    ctx.beginPath();
+    ctx.arc(0, 0, rad * 0.64, 0, Math.PI * 2);
+    ctx.stroke();
+  } else if (type === 2) {
+    // プリン
+    ctx.fillStyle = "#FFE49A";
+    ctx.beginPath();
+    ctx.moveTo(-rad * 0.42, -rad * 0.3);
+    ctx.quadraticCurveTo(0, -rad * 0.52, rad * 0.42, -rad * 0.3);
+    ctx.lineTo(rad * 0.68, rad * 0.42);
+    ctx.quadraticCurveTo(rad * 0.72, rad * 0.62, rad * 0.48, rad * 0.62);
+    ctx.lineTo(-rad * 0.48, rad * 0.62);
+    ctx.quadraticCurveTo(-rad * 0.72, rad * 0.62, -rad * 0.68, rad * 0.42);
+    ctx.closePath();
+    ctx.fill();
+    ctx.strokeStyle = "rgba(200, 150, 60, 0.55)";
+    ctx.lineWidth = rad * 0.07;
+    ctx.stroke();
+    ctx.fillStyle = "#C97E3F";
+    ctx.beginPath();
+    ctx.ellipse(0, -rad * 0.32, rad * 0.44, rad * 0.17, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse(rad * 0.18, -rad * 0.16, rad * 0.1, rad * 0.16, 0, 0, Math.PI * 2);
+    ctx.fill();
+  } else if (type === 3) {
+    // 三色だんご
+    ctx.strokeStyle = "#D8B08A";
+    ctx.lineWidth = rad * 0.1;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(-rad * 0.6, rad * 0.58);
+    ctx.lineTo(rad * 0.6, -rad * 0.58);
+    ctx.stroke();
+    var cols = ["#7ED491", "#FFF6EC", "#FFB7C9"];
+    var pos = [[-rad * 0.36, rad * 0.34], [0, 0], [rad * 0.36, -rad * 0.34]];
+    for (var d = 0; d < 3; d++) {
+      ctx.fillStyle = cols[d];
+      ctx.beginPath();
+      ctx.arc(pos[d][0], pos[d][1], rad * 0.4, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = "rgba(150, 90, 110, 0.35)";
+      ctx.lineWidth = rad * 0.05;
+      ctx.stroke();
+    }
+  } else {
+    // クッキー
+    ctx.fillStyle = t.color;
+    ctx.beginPath();
+    ctx.arc(0, 0, rad * 0.9, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = "#D87F3E";
+    ctx.lineWidth = rad * 0.1;
+    ctx.beginPath();
+    ctx.arc(0, 0, rad * 0.84, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.fillStyle = "#8A5A33";
+    var chips = [[-0.3, -0.25], [0.28, -0.32], [0.05, 0.12], [-0.32, 0.3], [0.38, 0.32]];
+    for (var c2 = 0; c2 < chips.length; c2++) {
+      ctx.beginPath();
+      ctx.arc(chips[c2][0] * rad, chips[c2][1] * rad, rad * 0.1, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // 共通のツヤ
+  ctx.fillStyle = "rgba(255, 255, 255, 0.45)";
   ctx.beginPath();
-  ctx.arc(x - rad * 0.3, y - rad * 0.35, rad * 0.32, 0, Math.PI * 2);
+  ctx.ellipse(-rad * 0.28, -rad * 0.34, rad * 0.2, rad * 0.13, -0.6, 0, Math.PI * 2);
   ctx.fill();
   ctx.restore();
-  GameKit.emoji(ctx, t.emoji, x, y + rad * 0.05, rad * 1.15);
 }
 function drawGuide(ctx) {
   var x = shooterX, y = muzzleY;
@@ -1332,7 +1593,7 @@ function drawGuide(ctx) {
 
 GameKit.run({
   title: "おかしパズルシュート",
-  instructions: "タップでお菓子を発射！同じ色を3つつなげて消そう",
+  instructions: "ドラッグで狙いをつけると発射!同じおかしを3つつなげて消そう",
   emoji: "🍭",
   init: function () {
     var W = GameKit.width(), H = GameKit.height();
@@ -1352,11 +1613,27 @@ GameKit.run({
     shot = null;
     flying = [];
     pops = [];
+    jiggles = [];
     shotsLeft = ADD_EVERY;
     finished = false;
+    dragDist = 0;
+    stillTime = 0;
+    aiming = false;
+    lastDragX = -1;
+    lastDragY = -1;
     GameKit.music.play("bgm_main");
   },
   update: function (dt) {
+    stillTime += dt;
+    if (stillTime >= FIRE_DELAY) {
+      if (aiming) {
+        if (fire()) { aiming = false; dragDist = 0; stillTime = 0; }
+        // 弾が飛行中で発射できない場合は stillTime を保持し、着弾後すぐ発射する
+      } else {
+        stillTime = 0;
+        dragDist = 0;
+      }
+    }
     if (shot) {
       var steps = 3;
       for (var s = 0; s < steps && shot; s++) {
@@ -1388,6 +1665,10 @@ GameKit.run({
       pops[j].t += dt;
       if (pops[j].t > 0.35) pops.splice(j, 1);
     }
+    for (var g = jiggles.length - 1; g >= 0; g--) {
+      jiggles[g].t += dt;
+      if (jiggles[g].t > 0.5) jiggles.splice(g, 1);
+    }
   },
   draw: function (ctx) {
     var W = GameKit.width(), H = GameKit.height();
@@ -1401,6 +1682,7 @@ GameKit.run({
       ctx.fillStyle = g;
       ctx.fillRect(0, 0, W, H);
     }
+
     ctx.save();
     ctx.strokeStyle = "rgba(255, 110, 130, 0.8)";
     ctx.lineWidth = 2;
@@ -1416,7 +1698,17 @@ GameKit.run({
       for (cc = 0; cc < grid[rr].length; cc++) {
         var v = grid[rr][cc];
         if (v === null) continue;
-        drawCandy(ctx, cellX(rr, cc), cellY(rr), v, r);
+        var wob = jiggleAt(rr, cc);
+        if (wob !== 0) {
+          // プルプル: 横に伸びて縦に縮む(その逆も)を繰り返す
+          ctx.save();
+          ctx.translate(cellX(rr, cc), cellY(rr));
+          ctx.scale(1 + wob, 1 - wob);
+          drawCandy(ctx, 0, 0, v, r);
+          ctx.restore();
+        } else {
+          drawCandy(ctx, cellX(rr, cc), cellY(rr), v, r);
+        }
       }
     }
     var i;
@@ -1450,7 +1742,21 @@ GameKit.run({
     } else {
       GameKit.emoji(ctx, "🐱", shooterX, shooterY, r * 2.4);
     }
-    if (!shot && !finished) drawCandy(ctx, shooterX, muzzleY, current, r);
+    if (!shot && !finished) {
+      drawCandy(ctx, shooterX, muzzleY, current, r);
+      if (aiming) {
+        // 発射までの残り時間リング(一周すると発射)
+        var pr = stillTime / FIRE_DELAY;
+        if (pr > 1) pr = 1;
+        ctx.save();
+        ctx.strokeStyle = "rgba(161, 91, 118, 0.9)";
+        ctx.lineWidth = Math.max(3, r * 0.18);
+        ctx.beginPath();
+        ctx.arc(shooterX, muzzleY, r * 1.3, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * pr);
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
 
     GameKit.text(ctx, "つぎ", shooterX + r * 3.1, shooterY - r * 1.1, {
       size: Math.round(r * 0.7), color: "#A15B76", align: "center"
@@ -1460,33 +1766,28 @@ GameKit.run({
       size: Math.round(r * 0.62), color: "#A15B76", align: "left"
     });
   },
-  onTap: function (p) {
-    if (finished || shot) return;
-    setAim(p.x, p.y);
-    GameKit.sfx.play("se_shoot");
-    shot = {
-      x: shooterX,
-      y: muzzleY,
-      vx: Math.cos(aimAngle) * SPEED,
-      vy: Math.sin(aimAngle) * SPEED,
-      color: current
-    };
-    current = nextColor;
-    nextColor = pickColor();
-    shotsLeft--;
-    if (shotsLeft <= 0) {
-      shotsLeft = ADD_EVERY;
-      addTopRow();
-      if (isDanger()) {
-        finished = true;
-        GameKit.sfx.play("hit");
-        GameKit.gameOver();
-      }
-    }
-  },
   onDrag: function (p) {
-    if (finished || shot) return;
-    setAim(p.x, p.y);
+    if (finished) return;
+    if (!shot) setAim(p.x, p.y);
+    if (lastDragX < 0) {
+      lastDragX = p.x;
+      lastDragY = p.y;
+      stillTime = 0;
+      return;
+    }
+    var mx = p.x - lastDragX, my = p.y - lastDragY;
+    lastDragX = p.x;
+    lastDragY = p.y;
+    var moved = Math.abs(mx) + Math.abs(my);
+    if (moved > 80) {
+      // 別のタッチに切り替わった瞬間の位置ジャンプは移動量に含めない
+      dragDist = 0;
+      stillTime = 0;
+      return;
+    }
+    if (moved > 0.5) stillTime = 0;
+    dragDist += moved;
+    if (dragDist > 16) aiming = true;
   }
 });
 </script>
